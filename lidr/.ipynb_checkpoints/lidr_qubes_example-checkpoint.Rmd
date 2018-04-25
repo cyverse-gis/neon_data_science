@@ -1,0 +1,217 @@
+---
+title: "lidR NEON example"
+author: "Tyson Lee Swetnam"
+date: "4/11/2018"
+output: html_document
+---
+
+# Individual plant / tree segmentation with lidR
+
+[lidR](https://github.com/Jean-Romain/lidR/wiki) is a R package created by Jean-Romain. It is built natively in R, and allows users to select from multiple segmentation techniques (e.g. watershed, 
+
+Example scripts provide below were written by Andrew Sanchez-Meador (Northern Arizona University), adapted for this example by Tyson L. Swetnam (University of Arizona).
+
+```{r, echo=FALSE}
+# Check for packages
+packageVersion('IRdisplay')
+packageVersion('repr')
+
+# Working in a Jupyter Notebook?
+# packageVersion('IRkernel')
+
+# install.packages("rjson")
+# install.packages("rgdal")
+# install.packages("lidR")
+# install.packages("IRdisplay")
+```
+
+```{r, echo=FALSE}
+library(lidR)
+library(rgdal)
+
+library(dplyr)
+library(ggplot2)
+library(rjson)
+library(bitops)
+library(jsonlite)
+library(leaflet)
+library(RCurl)
+```
+
+```{r}
+lidr_options(verbose = TRUE, progress = TRUE)
+```
+## Build a project 
+
+Set the working directory where the lidar tiles are, and where the output will be
+
+```{r}
+getwd()
+```
+
+```{r}
+setwd('/qubes/lessons/srer_laz/classified')
+```
+
+Create a catalog of the entire flight (at the directory level)
+
+```{r}
+project <- catalog("/qubes/lessons/srer_laz/classified//NEON_D14_SRER_DP1_514000_3519000_classified_point_cloud.laz")
+plot(project)                   
+```
+
+Read file information
+
+```{r}
+las = readLAS("/qubes/lessons/srer_laz/classified//NEON_D14_SRER_DP1_514000_3519000_classified_point_cloud.laz")
+las
+```
+## Set some global catalog options
+
+For this dummy example, the clustering size is 500 m and the buffer is 15 m using
+a single core (because this example is run on the CRAN server when the package is submitted).
+
+```{r}
+catalog_options(buffer = 15, multicore = 16, tiling_size = 500)
+```
+
+## Build the function that analyzes each cluster of the catalog.
+
+The function's first argument is a LAS object. The internal routine takes care of this part. The other arguments can be freely choosen by the user. See the following template:
+
+```{r}
+tree_area = function(las)
+{
+  if (is.null(las))
+    return(NULL)
+  
+  # segment trees (in this example the low point density does not enable
+  # accurate segmentation of trees. This is just a proof-of-concept)
+  lastrees(las, algorithm = "li2012")
+  
+  # Here we used the function tree_metric to compute some metrics for each tree. This
+  # function is defined later in the global environment.
+  m = tree_metrics(las, myMetrics(X, Y, Z, buffer, treeID))
+  
+  # If min buffer is 0 it means the trees were at least partly in the non-buffered area, so we
+  # want to keep these trees.
+  # However, the trees that are on the edge of the buffered area will be counted
+  # twice. So we must remove the trees on the right side and on the top side of the buffer
+  # If max buffer is <= 2 it means that the trees belong inside the area of interest, on
+  # the left side or the bottom side, or both.
+  m = m[minbuff == 0 & maxbuff <= 2]
+  
+  # Remove buffering information that is no longer useful
+  m[, c("minbuff","maxbuff") := NULL]
+  
+  return(m)
+}
+```
+
+This function enables users to extract, for a single tree, the position of the highest point and some information about the buffering position of the tree. The function tree_metrics takes care of mapping along each tree.
+
+```{r}
+myMetrics <- function(x, y, z, buff, treeID)
+{
+  i = which.max(z)
+  xcenter = x[i]
+  ycenter = y[i]
+  A = area(x,y)
+  dat = matrix(c(x, y), nrow=length(x), ncol=2)
+  ch = chull(dat)
+  coords <- dat[c(ch, ch[1]), ]  
+  sp_poly <- SpatialPolygons(list(Polygons(list(Polygon(coords)), ID=treeID[i])))
+  minbuff = min(buff)
+  maxbuff = max(buff)
+  
+  return(
+    list(
+      x = xcenter,
+      y = ycenter,
+      area = A,
+      crowns=list(sp_poly),
+      minbuff = minbuff,
+      maxbuff = maxbuff
+    ))
+}
+```
+
+Everything is now well defined, so now we can process over an entire catalog with hundreds of files.
+
+## Process the project. 
+
+The arguments of the user-defined function must belong in a labelled list. We also pass extra arguments to the function readLAS  to load only X, Y and Z coordinates. This way we save a huge amount of memory, which can be used for the current process.
+
+```{r}
+output = catalog_apply(project, tree_area, select = "xyz")
+output = data.table::rbindlist(output)
+list_of_SPols = output$crowns
+```
+
+Now remove the crown information from the output, to prepare to write the geojson.
+
+```{r}
+output = output[,1:4]
+```
+
+Set the spatial coordinates and projection for the treelocs output file and write the geojson
+
+```{r}
+coordinates(output)<-~x+y
+proj4string(output) <- CRS("+proj=utm +zone=12 +datum=WGS84")
+writeOGR(obj=output, dsn="/qubes/lessons/srer_laz/treelocs.geojson", layer="treeslocs", driver="GeoJSON", overwrite_layer = T)
+```
+
+Now we need to manipulate the crown polys to be able to coerse them to a SpatialPolygonsDataFrame
+
+```{r}
+Spols <- SpatialPolygons(lapply(1:length(list_of_SPols), function(i) {
+  Pol <- slot(list_of_SPols[[i]], "polygons")[[1]]
+  slot(Pol, "ID") <- as.character(i)
+  Pol
+}))
+```
+
+Get the polygon IDs
+
+```{r}
+pid <- sapply(slot(Spols, "polygons"), function(x) slot(x, "ID"))
+```
+
+Create dataframe with correct rownames
+
+```{r}
+p.df <- data.frame( ID=1:length(Spols), row.names = pid)
+```
+
+coersion to SpatialPolygonsDataFrame and write it out
+
+```{R}
+Spols <- SpatialPolygonsDataFrame(Spols, p.df)
+writeOGR(obj=Spols, dsn="/qubes/lessons/srer_laz/trees.geojson", layer="trees", driver="GeoJSON", overwrite_layer = T)
+```
+
+Plot it for fun
+
+```{r}
+library("leaflet")
+
+trees <- geojsonio::geojson_read("/qubes/lessons/srer_laz/trees.geojson")
+
+epsg32612 <- leafletCRS(crsClass = "L.Proj.CRS", code = "EPSG:32612", 
+    proj4def = "+proj=utm +zone=12 +datum=WGS84 +units=m +no_defs", 
+    resolutions = 2^(13:-1), 
+    origin = c(0, 0)
+)
+
+tile_url <- "http://api.geosition.com/tile/osm-bright-3006/{z}/{x}/{y}.png"
+tile_attrib <- "Map data &copy; <a href='http://www.openstreetmap.org/copyright'>OpenStreetMap contributors</a>, Imagery &copy; 2013 <a href='http://www.kartena.se/'>Kartena</a>"
+
+leaflet(options = leafletOptions(worldCopyJump = F, crs = epsg32612)) %>%
+  setView(11.965053, 57.70451, 13) %>%
+  addTiles(urlTemplate = tile_url,
+    attribution = tile_attrib,
+    options = tileOptions(minZoom = 0, maxZoom = 14, continuousWorld = T)) %>%
+  addMarkers(11.965053, 57.70451)
+```
+
