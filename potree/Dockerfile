@@ -1,4 +1,4 @@
-# Instructions: https://github.com/tyson-swetnam/QUBES_NEON 
+# Instructions: https://github.com/cyverse-gis/neon_data_science
 
 FROM ubuntu:16.04
 MAINTAINER Tyson Lee Swetnam
