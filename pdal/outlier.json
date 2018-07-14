@@ -13,7 +13,7 @@
     },
     {
       "type":"writers.las",
-      "filename":"/filtered/{}.laz"
+      "filename":"/vol_c/filtered/{}.laz"
     }
   ]
 }

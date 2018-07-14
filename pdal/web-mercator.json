@@ -1,4 +1,4 @@
 {
-    "threads": 16,
+    "threads": 4,
     "reprojection": { "out": "EPSG:3857" }
 }
